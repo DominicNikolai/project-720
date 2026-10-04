@@ -1885,7 +1885,9 @@
   fractalFolder
     .add(params, 'fractalLevels', 1, 10, 1)
     .name('Levels')
-    .onChange((value: number) => (uniforms.uFractalLevels.value = Math.round(value)));
+    .onChange(
+      (value: number) => (uniforms.uFractalLevels.value = Math.round(value))
+    );
   fractalFolder
     .add(params, 'lineWidthNear', -0.1, 0.2, 0.001)
     .name('Width A')
