@@ -1,0 +1,2042 @@
+<div class='spaceship'>
+  <div class='error' id='error'></div>
+</div>
+
+<style is:global>
+  .spaceship {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    background: #ffffff;
+    font-family:
+      Inter,
+      ui-sans-serif,
+      system-ui,
+      -apple-system,
+      BlinkMacSystemFont,
+      'Segoe UI',
+      sans-serif;
+  }
+
+  .spaceship canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .spaceship .error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-items: center;
+    padding: 32px;
+    box-sizing: border-box;
+    background: #fff;
+    color: #111;
+    font-size: 14px;
+    line-height: 1.5;
+    z-index: 10;
+  }
+
+  .spaceship .error.is-visible {
+    display: grid;
+  }
+</style>
+
+<script>
+  import {
+    BufferGeometry,
+    Camera,
+    Color,
+    ColorManagement,
+    Float32BufferAttribute,
+    LinearSRGBColorSpace,
+    Mesh,
+    NoToneMapping,
+    Scene,
+    ShaderMaterial,
+    Vector2,
+    Vector3,
+    WebGLRenderer
+  } from 'three';
+  import { GUI } from 'lil-gui';
+
+  type ColorUniform = { value: Color };
+
+  ColorManagement.enabled = false;
+
+  const host = document.querySelector<HTMLElement>('.spaceship');
+  const errorElement = document.querySelector<HTMLElement>('.error');
+
+  if (!host || !errorElement) {
+    throw new Error('Inside UFO Spaceship: mount points not found');
+  }
+
+  const vertexShader = /* glsl */ `
+    void main()
+    {
+        gl_Position = vec4(position, 1.0);
+    }
+  `;
+
+  const fragmentShader = /* glsl */ `
+    precision highp float;
+
+    uniform float uTime;
+    uniform vec2 uResolution;
+
+    uniform float uFloorY;
+    uniform float uApexY;
+    uniform float uHalfWidth;
+
+    uniform float uFractalTimeScale;
+    uniform float uTrailTimeScale;
+    uniform vec2 uFractalScale;
+    uniform float uFractalScroll;
+    uniform int uFractalLevels;
+    uniform float uLineWidthNear;
+    uniform float uLineWidthFar;
+    uniform float uLineSoftness;
+
+    uniform float uCameraSpeed;
+    uniform vec3 uCameraPosition;
+    uniform vec2 uCameraSway;
+    uniform vec2 uCameraLook;
+    uniform vec2 uLookSway;
+    uniform float uFocalLength;
+
+    uniform vec3 uBackgroundColor;
+    uniform vec3 uFarGlowColor;
+    uniform vec3 uInkColor;
+    uniform vec3 uElectricColor;
+    uniform vec3 uVioletColor;
+    uniform vec3 uBlueColor;
+    uniform vec3 uCyanColor;
+    uniform vec3 uLineInkColor;
+    uniform vec3 uTrailColor;
+    uniform vec3 uMicroTrailColor;
+    uniform vec3 uTinyTrailColor;
+    uniform vec3 uSeamColorA;
+    uniform vec3 uSeamColorB;
+
+    uniform float uTrailBrightness;
+    uniform float uMicroTrailBrightness;
+    uniform float uTinyTrailBrightness;
+    uniform float uSeamMix;
+    uniform float uSeamStrength;
+    uniform float uFogDensity;
+    uniform float uFarGlowStrength;
+
+    #define FAR_DISTANCE 120.3
+
+    mat2 rot(float a)
+    {
+        float s = sin(a);
+        float c = cos(a);
+
+        return mat2(
+            c, -s,
+            s,  c
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Utility
+    // ------------------------------------------------------------
+
+    float hash21(vec2 p)
+    {
+        p = fract(p * vec2(123.34, 345.44));
+        p += dot(p, p + 34.345);
+
+        return fract(p.x * p.y);
+    }
+
+    float sdBox2D(vec2 p, vec2 b)
+    {
+        vec2 d = abs(p) - b;
+
+        return length(max(d, 0.0)) +
+               min(max(d.x, d.y), 0.0);
+    }
+
+    float sdSegment2D(
+        vec2 p,
+        vec2 a,
+        vec2 b
+    )
+    {
+        vec2 pa = p - a;
+        vec2 ba = b - a;
+
+        float h = clamp(
+            dot(pa, ba) /
+            dot(ba, ba),
+            0.0,
+            1.0
+        );
+
+        return length(
+            pa -
+            ba * h
+        );
+    }
+
+    float lineMask(
+        float distanceToLine,
+        float width
+    )
+    {
+        return 1.0 - smoothstep(
+            width,
+            width + uLineSoftness,
+            distanceToLine
+        );
+    }
+
+    float periodicDistance(
+        float a,
+        float b
+    )
+    {
+        float d = abs(a - b);
+
+        return min(
+            d,
+            1.0 - d
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Moving trail along a segment
+    // ------------------------------------------------------------
+
+    float movingTrailOnSegment(
+        vec2 p,
+        vec2 a,
+        vec2 b,
+        float width,
+        float trailTime,
+        float speed,
+        float phase,
+        float direction
+    )
+    {
+        vec2 ba = b - a;
+
+        float segmentLength = max(
+            length(ba),
+            0.0001
+        );
+
+        vec2 axis =
+            ba /
+            segmentLength;
+
+        vec2 pa =
+            p - a;
+
+        float projection = clamp(
+            dot(pa, axis),
+            0.1,
+            segmentLength
+        );
+
+        float distanceToSegment = length(
+            pa -
+            axis * projection
+        );
+
+        float line =
+            1.0 -
+            smoothstep(
+                width,
+                width + 0.008,
+                distanceToSegment
+            );
+
+        float u =
+            projection /
+            segmentLength;
+
+        float flow = fract(
+            direction * u -
+            trailTime * speed +
+            phase
+        );
+
+        float headDistance =
+            periodicDistance(
+                flow,
+                0.0
+            );
+
+        float tailDistance =
+            periodicDistance(
+                flow,
+                -0.325
+            );
+
+        float sparkDistance =
+            periodicDistance(
+                flow,
+                0.53
+            );
+
+        float head = exp(
+            -190.0 *
+            headDistance *
+            headDistance
+        );
+
+        float tail =
+            0.50 *
+            exp(
+                -72.0 *
+                tailDistance *
+                tailDistance
+            );
+
+        float spark =
+            0.32 *
+            exp(
+                -260.0 *
+                sparkDistance *
+                sparkDistance
+            );
+
+        return line *
+            clamp(
+                head +
+                tail +
+                spark,
+                0.0,
+                1.0
+            );
+    }
+
+    // ------------------------------------------------------------
+    // Moving trails along a rectangular frame
+    // ------------------------------------------------------------
+
+    float movingTrailOnBox(
+        vec2 p,
+        vec2 halfSize,
+        float width,
+        float trailTime,
+        float speed,
+        float phase,
+        float direction
+    )
+    {
+        vec2 topLeft =
+            vec2(
+                -halfSize.x,
+                 halfSize.y
+            );
+
+        vec2 topRight =
+            vec2(
+                halfSize.x,
+                halfSize.y
+            );
+
+        vec2 bottomRight =
+            vec2(
+                 halfSize.x,
+                -halfSize.y
+            );
+
+        vec2 bottomLeft =
+            vec2(
+                -halfSize.x,
+                -halfSize.y
+            );
+
+        float trail = 0.0;
+
+        trail += movingTrailOnSegment(
+            p,
+            topLeft,
+            topRight,
+            width,
+            trailTime,
+            speed,
+            phase + 0.00,
+            direction
+        );
+
+        trail += movingTrailOnSegment(
+            p,
+            topRight,
+            bottomRight,
+            width,
+            trailTime,
+            speed,
+            phase + 0.07,
+            direction
+        );
+
+        trail += movingTrailOnSegment(
+            p,
+            bottomRight,
+            bottomLeft,
+            width,
+            trailTime,
+            speed,
+            phase + 0.19,
+            direction
+        );
+
+        trail += movingTrailOnSegment(
+            p,
+            bottomLeft,
+            topLeft,
+            width,
+            trailTime,
+            speed,
+            phase + 0.32,
+            direction
+        );
+
+        return clamp(
+            trail,
+            0.0,
+            1.0
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Cyberpunk palette
+    // ------------------------------------------------------------
+
+    vec3 cyberPalette(
+        float position,
+        float accent
+    )
+    {
+        vec3 ink = uInkColor;
+
+        vec3 electric = uElectricColor;
+
+        vec3 violet = uVioletColor;
+
+        vec3 blue = uBlueColor;
+
+        vec3 cyan = uCyanColor;
+
+        float blendA =
+            1.1 +
+            0.1 *
+            sin(
+                position *
+                0.22
+            );
+
+        float blendB =
+            0.5 +
+            0.5 *
+            sin(
+                position *
+                0.81 +
+                1.3
+            );
+
+        vec3 neon = mix(
+            violet,
+            blue,
+            blendA
+        );
+
+        neon = mix(
+            neon,
+            cyan,
+            accent * 0.71 +
+            blendB * 0.14
+        );
+
+        return mix(
+            electric,
+            mix(
+                ink,
+                neon,
+                0.29
+            ),
+            1.39
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Recursive circuit structure
+    // ------------------------------------------------------------
+
+    vec3 renderInterestingFractal(
+        vec2 surfacePosition,
+        float geometryTime,
+        float trailTime
+    )
+    {
+        vec2 p =
+            surfacePosition *
+            uFractalScale;
+
+        p.y -=
+            geometryTime *
+            uFractalScroll;
+
+        vec2 recursiveP = p;
+
+        float core = 0.0;
+        float halo = 0.0;
+
+        float trailLight = 0.0;
+        float microTrailLight = 0.0;
+        float microDetail = 0.0;
+
+        float colorIndex = 0.0;
+
+        for (int level = 0; level < 10; level++)
+        {
+            if (level >= uFractalLevels)
+            {
+                break;
+            }
+
+            float levelF =
+                float(level);
+
+            vec2 cellId =
+                floor(recursiveP);
+
+            vec2 q =
+                fract(recursiveP) -
+                0.5;
+
+            float randomValue = hash21(
+                cellId +
+                levelF * 18.94
+            );
+
+            float randomB = hash21(
+                cellId.yx +
+                levelF * 37.11 +
+                4.7
+            );
+
+            float randomC = hash21(
+                cellId +
+                levelF * 11.71 +
+                9.2
+            );
+
+            float randomD = hash21(
+                cellId.yx +
+                levelF * 7.43 +
+                17.6
+            );
+
+            if (randomValue > 0.2)
+            {
+                q = q.yx;
+            }
+
+            q.x *=
+                randomB > 0.3
+                    ? 1.0
+                    : -1.0;
+
+            q.y *=
+                fract(
+                    randomValue *
+                    4.31
+                ) > 0.5
+                    ? 1.0
+                    : -1.0;
+
+            float levelWeight =
+                exp(
+                    -0.17 *
+                    levelF
+                );
+
+            float lineWidth = mix(
+                uLineWidthNear,
+                uLineWidthFar,
+                levelF / 5.0
+            );
+
+            float microWidth =
+                lineWidth *
+                0.52;
+
+            // ----------------------------------------------------
+            // Frames
+            // ----------------------------------------------------
+
+            float frameDistance = abs(
+                sdBox2D(
+                    q,
+                    vec2(0.355)
+                )
+            );
+
+            float frame = lineMask(
+                frameDistance,
+                lineWidth
+            );
+
+            float innerFrameDistance = abs(
+                sdBox2D(
+                    q,
+                    vec2(0.235)
+                )
+            );
+
+            float innerFrame = lineMask(
+                innerFrameDistance,
+                microWidth * 0.85
+            );
+
+            float horizontalGap =
+                smoothstep(
+                    0.055,
+                    0.105,
+                    abs(q.y)
+                );
+
+            float verticalGap =
+                smoothstep(
+                    0.045,
+                    0.095,
+                    abs(q.x)
+                );
+
+            float gapSelector =
+                randomValue > 0.5
+                    ? horizontalGap
+                    : verticalGap;
+
+            frame *= gapSelector;
+
+            // ----------------------------------------------------
+            // Main trace
+            // ----------------------------------------------------
+
+            vec2 corner =
+                vec2(
+                    0.355,
+                    0.355
+                );
+
+            vec2 bend =
+                vec2(
+                    0.0,
+                    0.355
+                );
+
+            vec2 terminal =
+                vec2(
+                    0.0,
+                    0.045
+                );
+
+            if (randomB > 0.5)
+            {
+                bend =
+                    vec2(
+                        0.355,
+                        0.0
+                    );
+
+                terminal =
+                    vec2(
+                        0.045,
+                        0.0
+                    );
+            }
+
+            float traceA = lineMask(
+                sdSegment2D(
+                    q,
+                    corner,
+                    bend
+                ),
+                lineWidth * 0.72
+            );
+
+            float traceB = lineMask(
+                sdSegment2D(
+                    q,
+                    bend,
+                    terminal
+                ),
+                lineWidth * 0.72
+            );
+
+            float trace =
+                max(
+                    traceA,
+                    traceB
+                );
+
+            float terminalDistance = abs(
+                sdBox2D(
+                    q - terminal,
+                    vec2(0.034)
+                )
+            );
+
+            float terminalMask = lineMask(
+                terminalDistance,
+                lineWidth * 0.68
+            );
+
+            // ----------------------------------------------------
+            // Micro traces
+            // ----------------------------------------------------
+
+            vec2 microA1 =
+                vec2(
+                    -0.23,
+                    -0.10
+                );
+
+            vec2 microA2 =
+                vec2(
+                     0.08,
+                    -0.10
+                );
+
+            vec2 microB1 =
+                vec2(
+                    -0.08,
+                    -0.23
+                );
+
+            vec2 microB2 =
+                vec2(
+                    -0.08,
+                     0.06
+                );
+
+            vec2 microC1 =
+                vec2(
+                    0.16,
+                    0.18
+                );
+
+            vec2 microC2 =
+                vec2(
+                    0.32,
+                    0.18
+                );
+
+            vec2 microD1 =
+                vec2(
+                    -0.29,
+                     0.20
+                );
+
+            vec2 microD2 =
+                vec2(
+                    -0.15,
+                     0.20
+                );
+
+            vec2 microE1 =
+                vec2(
+                     0.12,
+                    -0.30
+                );
+
+            vec2 microE2 =
+                vec2(
+                     0.12,
+                    -0.17
+                );
+
+            if (randomC > 0.5)
+            {
+                microA1 = microA1.yx;
+                microA2 = microA2.yx;
+
+                microB1 = microB1.yx;
+                microB2 = microB2.yx;
+
+                microC1 = microC1.yx;
+                microC2 = microC2.yx;
+
+                microD1 = microD1.yx;
+                microD2 = microD2.yx;
+
+                microE1 = microE1.yx;
+                microE2 = microE2.yx;
+            }
+
+            float microTrace1 = lineMask(
+                sdSegment2D(
+                    q,
+                    microA1,
+                    microA2
+                ),
+                microWidth
+            );
+
+            float microTrace2 = lineMask(
+                sdSegment2D(
+                    q,
+                    microB1,
+                    microB2
+                ),
+                microWidth
+            );
+
+            float microTrace3 = lineMask(
+                sdSegment2D(
+                    q,
+                    microC1,
+                    microC2
+                ),
+                microWidth * 0.9
+            );
+
+            float microTrace4 = lineMask(
+                sdSegment2D(
+                    q,
+                    microD1,
+                    microD2
+                ),
+                microWidth * 0.72
+            );
+
+            float microTrace5 = lineMask(
+                sdSegment2D(
+                    q,
+                    microE1,
+                    microE2
+                ),
+                microWidth * 0.68
+            );
+
+            float microNode1 = lineMask(
+                abs(
+                    sdBox2D(
+                        q - microA2,
+                        vec2(0.012)
+                    )
+                ),
+                microWidth * 0.65
+            );
+
+            float microNode2 = lineMask(
+                abs(
+                    sdBox2D(
+                        q - microB2,
+                        vec2(0.010)
+                    )
+                ),
+                microWidth * 0.58
+            );
+
+            float microNode3 = lineMask(
+                abs(
+                    sdBox2D(
+                        q - microC1,
+                        vec2(0.008)
+                    )
+                ),
+                microWidth * 0.50
+            );
+
+            float microNode4 = lineMask(
+                abs(
+                    sdBox2D(
+                        q - microD2,
+                        vec2(0.007)
+                    )
+                ),
+                microWidth * 0.44
+            );
+
+            float visibility = 1.0;
+
+            if (level == 3)
+            {
+                visibility =
+                    step(
+                        0.34,
+                        randomValue
+                    );
+            }
+
+            if (level == 4)
+            {
+                visibility =
+                    step(
+                        0.58,
+                        randomValue
+                    );
+            }
+
+            float structure =
+            (
+                frame * 0.80 +
+                innerFrame * 0.34 +
+                trace * 1.00 +
+                terminalMask * 1.24 +
+
+                (
+                    microTrace1 +
+                    microTrace2 +
+                    microTrace3 +
+                    microTrace4 +
+                    microTrace5
+                ) * -0.53 +
+
+                (
+                    microNode1 +
+                    microNode2 +
+                    microNode3 +
+                    microNode4
+                ) * 0.26
+            )
+            *
+            levelWeight
+            *
+            visibility;
+
+            // ----------------------------------------------------
+            // Trail directions
+            // ----------------------------------------------------
+
+            float directionMain =
+                randomValue > 0.5
+                    ? 1.0
+                    : -1.0;
+
+            float directionMicro =
+                randomB > 0.5
+                    ? -1.0
+                    : 1.0;
+
+            float directionFrame =
+                randomD > 0.5
+                    ? 1.0
+                    : -1.0;
+
+            // ----------------------------------------------------
+            // Moving frame trails
+            // ----------------------------------------------------
+
+            float frameTrail =
+                movingTrailOnBox(
+                    q,
+                    vec2(0.425),
+                    lineWidth * 0.92,
+                    trailTime,
+                    0.24 +
+                    levelF * 0.022,
+                    randomValue * 0.81,
+                    directionFrame
+                );
+
+            float innerFrameTrail =
+                movingTrailOnBox(
+                    q,
+                    vec2(0.235),
+                    microWidth * 0.78,
+                    trailTime,
+                    0.32 +
+                    levelF * 0.025,
+                    randomC * 0.73,
+                    -directionFrame
+                );
+
+            // ----------------------------------------------------
+            // Main moving trails
+            // ----------------------------------------------------
+
+            float bigTrail =
+                frameTrail * 0.60 +
+                innerFrameTrail * 0.44;
+
+            bigTrail += movingTrailOnSegment(
+                q,
+                corner,
+                bend,
+                lineWidth * 0.95,
+                trailTime,
+                0.38 +
+                levelF * 0.028,
+                randomValue * 0.73,
+                directionMain
+            );
+
+            bigTrail += movingTrailOnSegment(
+                q,
+                bend,
+                terminal,
+                lineWidth * 0.86,
+                trailTime,
+                0.46 +
+                levelF * 0.025,
+                randomB * 0.69,
+                -directionMain
+            );
+
+            // ----------------------------------------------------
+            // Micro moving trails
+            // ----------------------------------------------------
+
+            float smallTrail = -0.2;
+
+            smallTrail += movingTrailOnSegment(
+                q,
+                microA1,
+                microA2,
+                microWidth * 0.92,
+                trailTime,
+                0.52 +
+                levelF * 0.030,
+                randomC * 0.77,
+                directionMicro
+            );
+
+            smallTrail += movingTrailOnSegment(
+                q,
+                microB1,
+                microB2,
+                microWidth * 0.88,
+                trailTime,
+                0.58 +
+                levelF * 0.032,
+                randomValue * 0.41,
+                -directionMicro
+            );
+
+            smallTrail += movingTrailOnSegment(
+                q,
+                microC1,
+                microC2,
+                microWidth * 0.82,
+                trailTime,
+                0.48 +
+                levelF * 0.026,
+                randomB * 0.58,
+                directionMain
+            );
+
+            smallTrail += movingTrailOnSegment(
+                q,
+                microD1,
+                microD2,
+                microWidth * 0.74,
+                trailTime,
+                0.66 +
+                levelF * 0.034,
+                randomD * 0.63,
+                -directionMain
+            );
+
+            smallTrail += movingTrailOnSegment(
+                q,
+                microE1,
+                microE2,
+                microWidth * 0.70,
+                trailTime,
+                0.72 +
+                levelF * 0.036,
+                randomC * 0.49,
+                directionFrame
+            );
+
+            // ----------------------------------------------------
+            // Very small moving trails
+            // ----------------------------------------------------
+
+            float tinyBoxTrail =
+                movingTrailOnBox(
+                    q,
+                    vec2(0.785),
+                    microWidth * 0.46,
+                    trailTime,
+                    0.82 +
+                    levelF * 0.040,
+                    randomD * 0.91,
+                    -directionMicro
+                );
+
+            float tinySegmentTrail =
+                movingTrailOnSegment(
+                    q,
+                    vec2(-0.06, 0.03),
+                    vec2( 0.07, 0.03),
+                    microWidth * 0.42,
+                    trailTime,
+                    0.94 +
+                    levelF * 0.045,
+                    randomValue * 0.57,
+                    directionMain
+                );
+
+            core += structure;
+
+            halo +=
+                structure *
+                mix(
+                    0.72,
+                    0.25,
+                    levelF / 4.0
+                );
+
+            trailLight +=
+                bigTrail *
+                levelWeight *
+                visibility;
+
+            microTrailLight +=
+                smallTrail *
+                levelWeight *
+                visibility;
+
+            microDetail +=
+            (
+                tinyBoxTrail * 0.72 +
+                tinySegmentTrail
+            )
+            *
+            levelWeight
+            *
+            visibility;
+
+            colorIndex +=
+                randomValue *
+                structure;
+
+            vec2 offset = vec2(
+                randomValue > 0.5
+                    ? 0.37
+                    : -0.37,
+
+                randomB > 0.5
+                    ? 0.29
+                    : -0.29
+            );
+
+            recursiveP =
+                recursiveP *
+                2.02 +
+                offset;
+        }
+
+        core =
+            clamp(
+                core,
+                0.0,
+                0.9
+            );
+
+        halo =
+            clamp(
+                halo,
+                0.0,
+                3.6
+            );
+
+        trailLight =
+            clamp(
+                trailLight,
+                0.0,
+                1.6
+            );
+
+        microTrailLight =
+            clamp(
+                microTrailLight,
+                0.0,
+                1.1
+            );
+
+        microDetail =
+            clamp(
+                microDetail,
+                0.0,
+                1.0
+            );
+
+        float normalizedColorIndex =
+            colorIndex /
+            max(core, 0.001);
+
+        float accent = clamp(
+            trailLight * 0.95 +
+            microTrailLight * 0.60 +
+            microDetail * 0.84,
+            0.0,
+            1.0
+        );
+
+        vec3 neon =
+            cyberPalette(
+                surfacePosition.y * 0.22 +
+                normalizedColorIndex * 2.4,
+                accent
+            );
+
+        vec3 lineInk = uLineInkColor;
+
+        vec3 trailColor = uTrailColor;
+
+        vec3 microTrailColor = uMicroTrailColor;
+
+        vec3 tinyTrailColor = uTinyTrailColor;
+
+        vec3 color =
+            lineInk *
+            core *
+            0.92;
+
+        color +=
+            neon *
+            core *
+            0.86;
+
+        color +=
+            neon *
+            halo *
+            0.16;
+
+        color +=
+            trailColor *
+            trailLight *
+            uTrailBrightness;
+
+        color +=
+            microTrailColor *
+            microTrailLight *
+            uMicroTrailBrightness;
+
+        color +=
+            tinyTrailColor *
+            microDetail *
+            uTinyTrailBrightness;
+
+        return color;
+    }
+
+    // ------------------------------------------------------------
+    // Corridor plane intersection
+    // ------------------------------------------------------------
+
+    float intersectCorridorPlane(
+        vec3 rayOrigin,
+        vec3 rayDirection,
+        vec3 inwardNormal,
+        float planeOffset
+    )
+    {
+        float originDistance =
+            dot(
+                inwardNormal,
+                rayOrigin
+            ) +
+            planeOffset;
+
+        float denominator =
+            dot(
+                inwardNormal,
+                rayDirection
+            );
+
+        if (denominator >= -0.00001)
+        {
+            return FAR_DISTANCE;
+        }
+
+        float distance =
+            -originDistance /
+            denominator;
+
+        return distance > 0.0
+            ? distance
+            : FAR_DISTANCE;
+    }
+
+    // ------------------------------------------------------------
+    // Main
+    // ------------------------------------------------------------
+
+    void mainImage(
+        out vec4 fragColor,
+        in vec2 fragCoord
+    )
+    {
+        vec2 uv =
+            (
+                fragCoord * 2.0 -
+                uResolution.xy
+            )
+            /
+            uResolution.y;
+
+        float time =
+            uTime;
+
+        float cameraSpeed = uCameraSpeed;
+
+        vec3 rayOrigin = vec3(
+            uCameraPosition.x +
+            sin(time * 0.18) * uCameraSway.x,
+
+            uCameraPosition.y +
+            sin(time * 0.22) * uCameraSway.y,
+
+            uCameraPosition.z +
+            time * cameraSpeed
+        );
+
+        vec3 cameraTarget =
+            rayOrigin +
+            vec3(
+                uCameraLook.x +
+                sin(time * 0.15) * uLookSway.x,
+
+                uCameraLook.y +
+                cos(time * 0.18) * uLookSway.y,
+
+                1.0
+            );
+
+        vec3 forward =
+            normalize(
+                cameraTarget -
+                rayOrigin
+            );
+
+        vec3 right =
+            normalize(
+                cross(
+                    vec3(0.0, 1.0, 0.0),
+                    forward
+                )
+            );
+
+        vec3 up =
+            normalize(
+                cross(
+                    forward,
+                    right
+                )
+            );
+
+        vec3 rayDirection =
+            normalize(
+                forward * uFocalLength +
+                right * uv.x +
+                up * uv.y
+            );
+
+        float corridorHeight =
+            uApexY -
+            uFloorY;
+
+        float slope =
+            uHalfWidth /
+            corridorHeight;
+
+        vec3 floorNormal =
+            vec3(
+                0.0,
+                1.0,
+                0.0
+            );
+
+        vec3 leftNormalUnnormalized =
+            vec3(
+                 1.0,
+                -slope,
+                 0.0
+            );
+
+        vec3 rightNormalUnnormalized =
+            vec3(
+                -1.0,
+                -slope,
+                 0.0
+            );
+
+        vec3 leftNormal =
+            normalize(
+                leftNormalUnnormalized
+            );
+
+        vec3 rightNormal =
+            normalize(
+                rightNormalUnnormalized
+            );
+
+        float floorOffset =
+            -uFloorY;
+
+        float sideOffset =
+            uHalfWidth +
+            slope *
+            uFloorY;
+
+        float floorDistance =
+            intersectCorridorPlane(
+                rayOrigin,
+                rayDirection,
+                floorNormal,
+                floorOffset
+            );
+
+        float leftDistance =
+            intersectCorridorPlane(
+                rayOrigin,
+                rayDirection,
+                leftNormalUnnormalized,
+                sideOffset
+            );
+
+        float rightDistance =
+            intersectCorridorPlane(
+                rayOrigin,
+                rayDirection,
+                rightNormalUnnormalized,
+                sideOffset
+            );
+
+        float hitDistance =
+            floorDistance;
+
+        float surfaceID =
+            0.0;
+
+        vec3 surfaceNormal =
+            floorNormal;
+
+        if (leftDistance < hitDistance)
+        {
+            hitDistance =
+                leftDistance;
+
+            surfaceID =
+                1.0;
+
+            surfaceNormal =
+                leftNormal;
+        }
+
+        if (rightDistance < hitDistance)
+        {
+            hitDistance =
+                rightDistance;
+
+            surfaceID =
+                2.0;
+
+            surfaceNormal =
+                rightNormal;
+        }
+
+        vec3 background = uBackgroundColor;
+
+        if (hitDistance >= FAR_DISTANCE)
+        {
+            fragColor =
+                vec4(
+                    background,
+                    1.0
+                );
+
+            return;
+        }
+
+        vec3 hitPosition =
+            rayOrigin +
+            rayDirection *
+            hitDistance;
+
+        float wallLength =
+            length(
+                vec2(
+                    uHalfWidth,
+                    corridorHeight
+                )
+            );
+
+        float surfaceU =
+            0.0;
+
+        if (surfaceID < 0.5)
+        {
+            surfaceU =
+                hitPosition.x;
+        }
+        else if (surfaceID < 1.5)
+        {
+            vec2 wallStart =
+                vec2(
+                    -uHalfWidth,
+                    uFloorY
+                );
+
+            vec2 wallDirection =
+                normalize(
+                    vec2(
+                        uHalfWidth,
+                        corridorHeight
+                    )
+                );
+
+            surfaceU =
+                dot(
+                    hitPosition.xy -
+                    wallStart,
+
+                    wallDirection
+                )
+                -
+                wallLength *
+                0.5;
+        }
+        else
+        {
+            vec2 wallStart =
+                vec2(
+                    uHalfWidth,
+                    uFloorY
+                );
+
+            vec2 wallDirection =
+                normalize(
+                    vec2(
+                        -uHalfWidth,
+                        corridorHeight
+                    )
+                );
+
+            surfaceU =
+                dot(
+                    hitPosition.xy -
+                    wallStart,
+
+                    wallDirection
+                )
+                -
+                wallLength *
+                0.7;
+        }
+
+        vec2 fractalCoordinates =
+            vec2(
+                surfaceU,
+                hitPosition.z
+            );
+
+        float fractalTime =
+            time *
+            uFractalTimeScale;
+
+        // Geometry uses the slowed fractalTime,
+        // while trails use the regular time.
+        vec3 fractalColor =
+            renderInterestingFractal(
+                fractalCoordinates,
+                fractalTime,
+                time * uTrailTimeScale
+            );
+
+        vec3 viewDirection =
+            normalize(
+                rayOrigin -
+                hitPosition
+            );
+
+        float facing =
+            max(
+                dot(
+                    surfaceNormal,
+                    viewDirection
+                ),
+                0.0
+            );
+
+        float fresnel =
+            pow(
+                clamp(
+                    1.0 - facing,
+                    0.0,
+                    1.0
+                ),
+                3.5
+            );
+
+        vec3 color =
+            fractalColor *
+            (
+                0.61 +
+                -0.59 *
+                facing
+            );
+
+        color +=
+            vec3(
+                -0.265,
+                -0.054,
+                0.014
+            );
+
+        color +=
+            fractalColor *
+            fresnel *
+            0.08;
+
+        float floorSignedDistance =
+            hitPosition.y -
+            uFloorY;
+
+        float leftSignedDistance =
+            (
+                dot(
+                    leftNormalUnnormalized,
+                    hitPosition
+                )
+                +
+                sideOffset
+            )
+            /
+            length(
+                leftNormalUnnormalized
+            );
+
+        float rightSignedDistance =
+            (
+                dot(
+                    rightNormalUnnormalized,
+                    hitPosition
+                )
+                +
+                sideOffset
+            )
+            /
+            length(
+                rightNormalUnnormalized
+            );
+
+        float seamDistance;
+
+        if (surfaceID < 0.5)
+        {
+            seamDistance =
+                min(
+                    leftSignedDistance,
+                    rightSignedDistance
+                );
+        }
+        else if (surfaceID < 1.5)
+        {
+            seamDistance =
+                min(
+                    floorSignedDistance,
+                    rightSignedDistance
+                );
+        }
+        else
+        {
+            seamDistance =
+                min(
+                    floorSignedDistance,
+                    leftSignedDistance
+                );
+        }
+
+        float seamGlow =
+            exp(
+                -max(
+                    seamDistance,
+                    -2.0
+                ) *
+                6.9
+            );
+
+        vec3 seamColor = mix(uSeamColorA, uSeamColorB, uSeamMix);
+
+        color +=
+            seamColor *
+            seamGlow *
+            uSeamStrength;
+
+        float fog =
+            exp(
+                -hitDistance *
+                uFogDensity
+            );
+
+        vec3 farGlowColor = mix(
+            background,
+            uFarGlowColor,
+            uFarGlowStrength
+        );
+
+        color =
+            mix(
+                farGlowColor,
+                color,
+                fog
+            );
+
+        fragColor =
+            vec4(
+                color,
+                1.0
+            );
+    }
+
+    void main()
+    {
+        vec4 color;
+        mainImage(color, gl_FragCoord.xy);
+        gl_FragColor = color;
+    }
+
+  `;
+
+  const params = {
+    dpr: 1,
+
+    fractalSpeed: 1.15,
+    trailSpeed: 0.92,
+    fractalScaleX: 0.54,
+    fractalScaleY: 0.3,
+    fractalScroll: 0.26,
+    fractalLevels: 10,
+    lineWidthNear: -0.009,
+    lineWidthFar: 0.038,
+    lineSoftness: 8.312,
+
+    trailBrightness: 0.19,
+    microTrailBrightness: 1.09,
+    tinyTrailBrightness: 0.0,
+
+    cameraSpeed: 1.1,
+    cameraX: 0.0,
+    cameraY: -0.97,
+    cameraZ: 0.0,
+    cameraSwayX: 0.045,
+    cameraSwayY: 0.0,
+    cameraLookX: 0.0,
+    cameraLookY: 0.028,
+    lookSwayX: 0.024,
+    lookSwayY: 0.0,
+    focalLength: 0.54,
+
+    floorY: -1.22,
+    apexY: 1.65,
+    halfWidth: 1.19,
+    fogDensity: 0.089,
+    farGlowStrength: 0.14,
+    seamMix: 0.96,
+    seamStrength: 2.64,
+
+    background: '#d6f5ff',
+    farGlow: '#1fe0ff',
+    ink: '#050512',
+    electric: '#000000',
+    violet: '#273f59',
+    blue: '#42678f',
+    cyan: '#33e4ff',
+    lineInk: '#03030d',
+    trail: '#47b8ff',
+    microTrail: '#85e0ff',
+    tinyTrail: '#c2f0ff',
+    seamA: '#2e0842',
+    seamB: '#055285'
+  };
+
+  const renderer = new WebGLRenderer({
+    antialias: false,
+    alpha: false,
+    powerPreference: 'high-performance',
+    preserveDrawingBuffer: false
+  });
+
+  renderer.outputColorSpace = LinearSRGBColorSpace;
+  renderer.toneMapping = NoToneMapping;
+  renderer.setClearColor(0x85c4ff, 1);
+  host.appendChild(renderer.domElement);
+
+  const scene = new Scene();
+  const camera = new Camera();
+
+  const geometry = new BufferGeometry();
+  geometry.setAttribute(
+    'position',
+    new Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3)
+  );
+
+  const uniforms = {
+    uTime: { value: 0 },
+    uResolution: { value: new Vector2(1, 1) },
+
+    uFloorY: { value: params.floorY },
+    uApexY: { value: params.apexY },
+    uHalfWidth: { value: params.halfWidth },
+
+    uFractalTimeScale: { value: params.fractalSpeed },
+    uTrailTimeScale: { value: params.trailSpeed },
+    uFractalScale: {
+      value: new Vector2(params.fractalScaleX, params.fractalScaleY)
+    },
+    uFractalScroll: { value: params.fractalScroll },
+    uFractalLevels: { value: params.fractalLevels },
+    uLineWidthNear: { value: params.lineWidthNear },
+    uLineWidthFar: { value: params.lineWidthFar },
+    uLineSoftness: { value: params.lineSoftness },
+
+    uCameraSpeed: { value: params.cameraSpeed },
+    uCameraPosition: {
+      value: new Vector3(params.cameraX, params.cameraY, params.cameraZ)
+    },
+    uCameraSway: { value: new Vector2(params.cameraSwayX, params.cameraSwayY) },
+    uCameraLook: { value: new Vector2(params.cameraLookX, params.cameraLookY) },
+    uLookSway: { value: new Vector2(params.lookSwayX, params.lookSwayY) },
+    uFocalLength: { value: params.focalLength },
+
+    uBackgroundColor: { value: new Color().setRGB(0.839, 0.961, 1.0) },
+    uFarGlowColor: { value: new Color().setRGB(0.12, 0.88, 1.0) },
+    uInkColor: { value: new Color().setRGB(0.018, 0.02, 0.07) },
+    uElectricColor: { value: new Color().setRGB(0.0, 0.0, 0.0) },
+    uVioletColor: { value: new Color().setRGB(0.02, 0.494, 1.0) },
+    uBlueColor: { value: new Color().setRGB(0.137, 0.373, 0.624) },
+    uCyanColor: { value: new Color().setRGB(0.12, 0.88, 1.0) },
+    uLineInkColor: { value: new Color().setRGB(0.01, 0.012, 0.05) },
+    uTrailColor: { value: new Color().setRGB(0.28, 0.72, 1.0) },
+    uMicroTrailColor: { value: new Color().setRGB(0.52, 0.88, 1.0) },
+    uTinyTrailColor: { value: new Color().setRGB(0.76, 0.94, 1.0) },
+    uSeamColorA: { value: new Color().setRGB(0.18, 0.03, 0.26) },
+    uSeamColorB: { value: new Color().setRGB(0.02, 0.32, 0.52) },
+
+    uTrailBrightness: { value: params.trailBrightness },
+    uMicroTrailBrightness: { value: params.microTrailBrightness },
+    uTinyTrailBrightness: { value: params.tinyTrailBrightness },
+    uSeamMix: { value: params.seamMix },
+    uSeamStrength: { value: params.seamStrength },
+    uFogDensity: { value: params.fogDensity },
+    uFarGlowStrength: { value: params.farGlowStrength }
+  };
+
+  const material = new ShaderMaterial({
+    vertexShader,
+    fragmentShader,
+    uniforms,
+    depthTest: false,
+    depthWrite: false,
+    transparent: false
+  });
+
+  const mesh = new Mesh(geometry, material);
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+
+  const drawingBufferSize = new Vector2();
+
+  function resize() {
+    renderer.setPixelRatio(params.dpr);
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    renderer.getDrawingBufferSize(drawingBufferSize);
+    uniforms.uResolution.value.copy(drawingBufferSize);
+  }
+
+  function setDisplayColor(uniform: ColorUniform, hex: string) {
+    const value = Number.parseInt(hex.slice(1), 16);
+    const r = ((value >> 16) & 255) / 255;
+    const g = ((value >> 8) & 255) / 255;
+    const b = (value & 255) / 255;
+    uniform.value.setRGB(r, g, b);
+  }
+
+  const gui = new GUI({
+    title: 'Scene Settings',
+    width: 320
+  });
+
+  const renderFolder = gui.addFolder('Render');
+  renderFolder.add(params, 'dpr', 0.25, 2.5, 0.05).name('DPR').onChange(resize);
+
+  const fractalFolder = gui.addFolder('Fractal');
+  fractalFolder
+    .add(params, 'fractalSpeed', 0.0, 3.0, 0.01)
+    .name('Speed')
+    .onChange((value: number) => (uniforms.uFractalTimeScale.value = value));
+  fractalFolder
+    .add(params, 'fractalScaleX', 0.05, 2.0, 0.01)
+    .name('Scale X')
+    .onChange((value: number) => (uniforms.uFractalScale.value.x = value));
+  fractalFolder
+    .add(params, 'fractalScaleY', 0.05, 2.0, 0.01)
+    .name('Scale Y')
+    .onChange((value: number) => (uniforms.uFractalScale.value.y = value));
+  fractalFolder
+    .add(params, 'fractalScroll', -1.0, 1.0, 0.01)
+    .name('Offset')
+    .onChange((value: number) => (uniforms.uFractalScroll.value = value));
+  fractalFolder
+    .add(params, 'fractalLevels', 1, 10, 1)
+    .name('Levels')
+    .onChange((value: number) => (uniforms.uFractalLevels.value = Math.round(value)));
+  fractalFolder
+    .add(params, 'lineWidthNear', -0.1, 0.2, 0.001)
+    .name('Width A')
+    .onChange((value: number) => (uniforms.uLineWidthNear.value = value));
+  fractalFolder
+    .add(params, 'lineWidthFar', -0.1, 0.2, 0.001)
+    .name('Width B')
+    .onChange((value: number) => (uniforms.uLineWidthFar.value = value));
+  fractalFolder
+    .add(params, 'lineSoftness', 0.001, 12.0, 0.001)
+    .name('Softness')
+    .onChange((value: number) => (uniforms.uLineSoftness.value = value));
+
+  const trailsFolder = gui.addFolder('Trails');
+  trailsFolder
+    .add(params, 'trailSpeed', 0.0, 4.0, 0.01)
+    .name('Speed')
+    .onChange((value: number) => (uniforms.uTrailTimeScale.value = value));
+  trailsFolder
+    .add(params, 'trailBrightness', 0.0, 3.0, 0.01)
+    .name('Main')
+    .onChange((value: number) => (uniforms.uTrailBrightness.value = value));
+  trailsFolder
+    .add(params, 'microTrailBrightness', 0.0, 3.0, 0.01)
+    .name('Micro')
+    .onChange((value: number) => (uniforms.uMicroTrailBrightness.value = value));
+  trailsFolder
+    .add(params, 'tinyTrailBrightness', 0.0, 3.0, 0.01)
+    .name('Tiny')
+    .onChange((value: number) => (uniforms.uTinyTrailBrightness.value = value));
+
+  const cameraFolder = gui.addFolder('Camera');
+  cameraFolder
+    .add(params, 'cameraSpeed', -3.0, 3.0, 0.01)
+    .name('Speed')
+    .onChange((value: number) => (uniforms.uCameraSpeed.value = value));
+  cameraFolder
+    .add(params, 'cameraX', -3.0, 3.0, 0.01)
+    .name('Position X')
+    .onChange((value: number) => (uniforms.uCameraPosition.value.x = value));
+  cameraFolder
+    .add(params, 'cameraY', -3.0, 3.0, 0.01)
+    .name('Position Y')
+    .onChange((value: number) => (uniforms.uCameraPosition.value.y = value));
+  cameraFolder
+    .add(params, 'cameraZ', -10.0, 10.0, 0.01)
+    .name('Position Z')
+    .onChange((value: number) => (uniforms.uCameraPosition.value.z = value));
+  cameraFolder
+    .add(params, 'cameraSwayX', 0.0, 1.0, 0.001)
+    .name('Sway X')
+    .onChange((value: number) => (uniforms.uCameraSway.value.x = value));
+  cameraFolder
+    .add(params, 'cameraSwayY', 0.0, 1.0, 0.001)
+    .name('Sway Y')
+    .onChange((value: number) => (uniforms.uCameraSway.value.y = value));
+  cameraFolder
+    .add(params, 'cameraLookX', -1.0, 1.0, 0.001)
+    .name('Look X')
+    .onChange((value: number) => (uniforms.uCameraLook.value.x = value));
+  cameraFolder
+    .add(params, 'cameraLookY', -1.0, 1.0, 0.001)
+    .name('Look Y')
+    .onChange((value: number) => (uniforms.uCameraLook.value.y = value));
+  cameraFolder
+    .add(params, 'lookSwayX', 0.0, 0.5, 0.001)
+    .name('Look Sway X')
+    .onChange((value: number) => (uniforms.uLookSway.value.x = value));
+  cameraFolder
+    .add(params, 'lookSwayY', 0.0, 0.5, 0.001)
+    .name('Look Sway Y')
+    .onChange((value: number) => (uniforms.uLookSway.value.y = value));
+  cameraFolder
+    .add(params, 'focalLength', 0.25, 4.0, 0.01)
+    .name('Focal Length')
+    .onChange((value: number) => (uniforms.uFocalLength.value = value));
+
+  const corridorFolder = gui.addFolder('Corridor');
+  corridorFolder
+    .add(params, 'floorY', -4.0, 1.0, 0.01)
+    .name('Floor Y')
+    .onChange((value: number) => (uniforms.uFloorY.value = value));
+  corridorFolder
+    .add(params, 'apexY', 0.1, 6.0, 0.01)
+    .name('Apex Y')
+    .onChange((value: number) => (uniforms.uApexY.value = value));
+  corridorFolder
+    .add(params, 'halfWidth', 0.2, 6.0, 0.01)
+    .name('Half Width')
+    .onChange((value: number) => (uniforms.uHalfWidth.value = value));
+  corridorFolder
+    .add(params, 'fogDensity', 0.0, 0.2, 0.001)
+    .name('Fog')
+    .onChange((value: number) => (uniforms.uFogDensity.value = value));
+  corridorFolder
+    .add(params, 'farGlowStrength', 0.0, 1.0, 0.01)
+    .name('Far Cyan')
+    .onChange((value: number) => (uniforms.uFarGlowStrength.value = value));
+  corridorFolder
+    .add(params, 'seamMix', 0.0, 1.0, 0.01)
+    .name('Seam Mix')
+    .onChange((value: number) => (uniforms.uSeamMix.value = value));
+  corridorFolder
+    .add(params, 'seamStrength', 0.0, 8.0, 0.01)
+    .name('Seam Glow')
+    .onChange((value: number) => (uniforms.uSeamStrength.value = value));
+
+  const colorFolder = gui.addFolder('Colors');
+  const colorBindings: Array<[string, string, ColorUniform]> = [
+    ['background', 'Background', uniforms.uBackgroundColor],
+    ['farGlow', 'Far Glow', uniforms.uFarGlowColor],
+    ['ink', 'Ink', uniforms.uInkColor],
+    ['electric', 'Electric', uniforms.uElectricColor],
+    ['violet', 'Violet', uniforms.uVioletColor],
+    ['blue', 'Blue', uniforms.uBlueColor],
+    ['cyan', 'Cyan', uniforms.uCyanColor],
+    ['lineInk', 'Line Ink', uniforms.uLineInkColor],
+    ['trail', 'Trail', uniforms.uTrailColor],
+    ['microTrail', 'Micro Trail', uniforms.uMicroTrailColor],
+    ['tinyTrail', 'Tiny Trail', uniforms.uTinyTrailColor],
+    ['seamA', 'Seam A', uniforms.uSeamColorA],
+    ['seamB', 'Seam B', uniforms.uSeamColorB]
+  ];
+
+  for (const [key, label, uniform] of colorBindings) {
+    colorFolder
+      .addColor(params, key)
+      .name(label)
+      .onChange((value: string) => setDisplayColor(uniform, value));
+  }
+
+  gui.close();
+
+  window.addEventListener('resize', resize, { passive: true });
+  resize();
+
+  const startTime = performance.now();
+
+  renderer.setAnimationLoop(() => {
+    uniforms.uTime.value = (performance.now() - startTime) * 0.001;
+    renderer.render(scene, camera);
+  });
+
+  renderer.domElement.addEventListener('webglcontextlost', (event: Event) => {
+    event.preventDefault();
+    errorElement.textContent = 'The WebGL context was lost. Reload the page.';
+    errorElement.classList.add('is-visible');
+  });
+
+  window.addEventListener('error', (event: ErrorEvent) => {
+    errorElement.textContent = event.message || 'Failed to start the scene.';
+    errorElement.classList.add('is-visible');
+  });
+</script>
