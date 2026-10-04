@@ -34,8 +34,6 @@ body {
   flex-direction: column;
 }
 
-
-
 body {
   --sb-track-color: #000;
   --sb-thumb-color: var(--gradient-btn);
